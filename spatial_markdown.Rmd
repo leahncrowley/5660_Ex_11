@@ -1,0 +1,260 @@
+---
+title: "Tragically, not Texas"
+author: "Leah N. Crowley"
+date: "2023-11-14"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 2
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+# Call relevant libraries to workspace for this assignment: 
+  library(biscale)
+  library(car)
+  library(cleangeo)
+  library(cowplot)
+  library(geosphere)
+  library(maps)
+  library(mapproj)
+  library(maptools)
+  library(spatialreg)
+  library(spdep)
+  library(tidyverse)
+  library(visreg)
+
+```
+
+
+```{r data, include=FALSE}
+
+data <- read.csv("childpov18_southfull.csv")
+LA   <- data %>% filter(State == "LA")
+
+names(LA)[names(LA)=="X2016.child.poverty"] <- "child.pov.2016"
+
+```
+
+# Ordinary Least Squares 
+
+Test the relationship of unemployment in Louisiana and the other variables in the dataset: 
+
+```{r OLS, echo=FALSE, message=FALSE, warning=FALSE}
+
+equation <- unemployment_13 ~ rural + urban + lnmanufacturing + lnag + 
+  lnretail + lnhealthss + lnconstruction + lnlesshs + 
+  lnchildpov + lnsinglemom + lnblack + lnhispanic + 
+  lnuninsured + lnincome_ratio + lnteenbirth + lnunmarried
+
+options(scipen = 5)
+
+ols <- lm(equation, data=LA)
+summary(ols)
+
+```
+
+```{r OLS Visual, echo=FALSE, message=FALSE, warning=FALSE}
+
+par(mfrow=c(4,4), mar=c(2, 2, 2, 2))
+visreg(ols)
+
+```
+
+# Contiguity (Spatial Regression Analysis)
+
+## Create a list of contiguity neighbors: 
+```{r Contiguity Neighbors, echo=FALSE, message=FALSE, warning=FALSE}
+
+fips <- county.fips
+fips.codes <- separate(data = fips, col = polyname, into = c("state", "county"), sep = ",")
+LA_fips <- subset(fips.codes, state=="louisiana", select=fips)
+
+louisiana <- maps::map(database = "county", regions = "louisiana", fill=T, plot=F)
+LA_sp = map2SpatialPolygons(louisiana, LA_fips$fips, CRS("+proj=longlat"))
+
+cleaned <- clgeo_Clean(LA_sp)
+neighb.data <- poly2nb(cleaned, queen=T)
+cont.neighb <- nb2listw(neighb.data,style="W", zero.policy = TRUE)
+
+```
+
+## Moran’s Correlation and LaGrange Multiplier Tests
+```{r Moran and LaGrange, echo=FALSE, message=FALSE, warning=FALSE}
+
+lm.morantest(ols, cont.neighb)
+
+lm.LMtests(ols, cont.neighb, test="all")
+
+```
+
+## Spatially lagged X model
+```{r Lagged, echo=FALSE, message=FALSE, warning=FALSE}
+
+SLX.model <- spatialreg::lmSLX(equation, data=LA, cont.neighb)
+summary(SLX.model)
+
+summary(spatialreg::impacts(SLX.model, cont.neighb), zstats = TRUE)[["pzmat"]]
+
+```
+
+## Spatial lag model
+```{r Lag, echo=FALSE, message=FALSE, warning=FALSE}
+
+sp.lag.model <- spatialreg::lagsarlm(equation, data=LA, cont.neighb)
+summary(sp.lag.model, Nagelkerke = TRUE)
+
+summary(spatialreg::impacts(sp.lag.model, listw = cont.neighb, R=100), zstats = TRUE)[["pzmat"]]
+
+```
+## Spatial error model
+```{r Spatial error, echo=FALSE, message=FALSE, warning=FALSE}
+
+sp.err.model <- spatialreg::errorsarlm(equation, data=LA, cont.neighb)
+summary(sp.err.model, Nagelkerke = TRUE)
+
+spatialreg::Hausman.test(sp.err.model)
+
+```
+
+## Spatial Durbin model
+```{r Durbin, echo=FALSE, message=FALSE, warning=FALSE}
+
+sd.err <- spatialreg::errorsarlm(equation, LA, cont.neighb, etype = "emixed")
+sdm <- spatialreg::lagsarlm(equation, LA, cont.neighb, type = "mixed")
+
+summary(sd.err, Nagelkerke = TRUE)
+
+```
+
+# K-nearest neighbors 
+## Create list of k-neighbors 
+```{r k-neighbors, echo=FALSE, message=FALSE, warning=FALSE}
+
+all.xy <-centroid(LA_sp)
+colnames(all.xy) <- c("x","y")
+
+# Create neighbors
+  all.dist.k1 <- knn2nb(knearneigh(all.xy, k=1, longlat = TRUE))
+  all.dist.k3 <- knn2nb(knearneigh(all.xy, k=3, longlat = TRUE))
+  all.dist.k5 <- knn2nb(knearneigh(all.xy, k=5, longlat = TRUE))
+
+# Determine max k distance value to neighbor
+  all.max.k1 <- max(unlist(nbdists(all.dist.k1, all.xy, longlat=TRUE)))
+  all.max.k3 <- max(unlist(nbdists(all.dist.k3, all.xy, longlat=TRUE)))
+  all.max.k5 <- max(unlist(nbdists(all.dist.k5, all.xy, longlat=TRUE)))
+
+# Calculate neighbors based on distance
+  all.sp.dist.k1 <- dnearneigh(all.xy, d1=0, d2=1 * all.max.k1, longlat = TRUE)
+  all.sp.dist.k3 <- dnearneigh(all.xy, d1=0, d2=1 * all.max.k3, longlat = TRUE)
+  all.sp.dist.k5 <- dnearneigh(all.xy, d1=0, d2=1 * all.max.k5, longlat = TRUE)
+
+# Create neighbor list
+  all.dist.neighb.k1 <- nb2listw(all.sp.dist.k1,style="W", zero.policy = TRUE)
+  all.dist.neighb.k3 <- nb2listw(all.sp.dist.k3,style="W", zero.policy = TRUE)
+  all.dist.neighb.k5 <- nb2listw(all.sp.dist.k5,style="W", zero.policy = TRUE)
+  
+```
+
+## Calculate distance lag model for each k-distance: 
+```{r k lag model, echo=FALSE, message=FALSE, error=FALSE}
+
+all.dist.lag.k1 <- spatialreg::lagsarlm(equation, data = LA, listw = all.dist.neighb.k1)
+all.dist.lag.k3 <- spatialreg::lagsarlm(equation, data = LA, listw = all.dist.neighb.k3)
+all.dist.lag.k5 <- spatialreg::lagsarlm(equation, data = LA, listw = all.dist.neighb.k5)
+
+summary(all.dist.lag.k1, Nagelkerke = TRUE)
+
+```
+
+## Create distance error model for each k-distance: 
+```{r k error model, echo=FALSE, message=FALSE, error=FALSE}
+
+all.dist.err.k1 <- spatialreg::errorsarlm(equation, data = LA, listw = all.dist.neighb.k1)
+all.dist.err.k3 <- spatialreg::errorsarlm(equation, data = LA, listw = all.dist.neighb.k3)
+all.dist.err.k5 <- spatialreg::errorsarlm(equation, data = LA, listw = all.dist.neighb.k5)
+
+summary(all.dist.err.k1, Nagelkerke = TRUE)
+
+```
+
+# Map time! 
+## Combine columns from unemployment and error model data sets:
+```{r mapping, echo=FALSE, message=FALSE, error=FALSE}
+
+dist.err.data <- summary(all.dist.err.k1, correlation=TRUE, Nagelkerke = TRUE)
+
+dist.err.output <- cbind.data.frame(LA$FIPS,
+                                    dist.err.data$fitted.values, 
+                                    dist.err.data$residual, 
+                                    LA$child.pov.2016, 
+                                    LA$lnsinglemom, 
+                                    LA$lnuninsured, 
+                                    LA$lnlesshs, 
+                                    LA$lnunemployment,
+                                    LA$lnincome_ratio,
+                                    stringsAsFactors = FALSE)
+
+# Renaming columns
+  colnames(dist.err.output) <- c("fips","fitted","resid","childpov",
+                          "single_mom","uninsured","less_hs","unemployed","income_ratio")
+
+```
+
+
+```{r fortify, error=FALSE, message=FALSE, include=FALSE}
+
+LA_fortify <- fortify(LA_sp)
+
+LA_poly <- merge(x = LA_fortify, y = dist.err.output, 
+                 by.x = "id", by.y = "fips", all = TRUE)
+
+bivariate_data <- bi_class(LA_poly, x = uninsured, y = unemployed, 
+                           dim = 3, style = "quantile")
+
+legend <- bi_legend(pal = "PinkGrn",
+                    dim = 4,
+                    xlab = "Uninsured Individuals",
+                    ylab = "Unemployed Individuals",
+                    size = 6)
+
+```
+
+```{r basemap, include=FALSE}
+
+world <- map_data("world")
+states <- map_data("state")
+southern_states <- subset(states, region %in% 
+                            c("texas", "arkansas", "louisiana", "mississippi", 
+                              "alabama", "georgia", "florida", "north carolina",
+                              "south carolina", "tennessee", "oklahoma", 
+                              "kentucky", "west virginia", "virginia", 
+                              "maryland", "delaware", "district of columbia"))
+
+```
+
+```{r map, echo=FALSE, message=FALSE, warning=FALSE}
+
+mom_pov_map <- ggplot() + 
+  geom_polygon(data = world, aes(x=long,y=lat, group=group), fill = "gray95", color = "black") +
+  geom_polygon(data = states, aes(x=long,y=lat, group=group), fill = "lightgray", color = "black") +
+  geom_polygon(data = southern_states, aes(x=long,y=lat, group=group), fill = NA, size = 0.01, color = "black") +  
+  geom_polygon(data = bivariate_data, aes(x=long, y=lat, group=group, fill = bi_class), color = "black", show.legend = FALSE) + 
+  bi_scale_fill(pal = "PinkGrn", dim = 3) +
+  coord_map("conic", lat0 = 30, xlim=c(-95.5,-88.4), ylim=c(26,34)) +
+  theme_void() + theme(legend.title.align=0.5) +
+  theme(panel.background = element_rect(fill = 'lightblue'),
+        panel.grid.major = element_line(colour = NA)) +
+  labs(x = "Longitude", y = "Latitude", fill = "Child Poverty", 
+       title = "Unemployment and Uninsured Individuals in LA") +
+  theme(plot.title = element_text(face = "bold", hjust = 0.25))
+
+final_map <- ggdraw() +
+  draw_plot(mom_pov_map, 0, 0, 1, 1) +
+  draw_plot(legend, 0.375, 0.05, 0.25, 0.25)
+
+final_map
+
+```
